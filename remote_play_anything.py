@@ -7,9 +7,10 @@ from pathlib import Path
 from urllib.parse import quote
 
 # This file is used to communicate information from this runtime into the steam invocation.
-restart_file = Path.home() / 'remote_play_anywhere.txt'
+restart_file = Path.home() / 'remote_play_anything.txt'
 
 steam_folder = None
+app_data = {}
 def get_steam_folder():
   global steam_folder
   if sys.platform == 'win32':
@@ -25,12 +26,46 @@ def get_steam_folder():
     steam_folder = Path(input('Enter steam folder: '))
   print('Determined steam folder: ' + str(steam_folder))
 
+  with (steam_folder / 'appcache' / 'appinfo.vdf').open('rb') as f:
+    bytes = f.read()
+
+  import struct
+  import re
+
+  appid_regex = re.compile(rb"""
+    (?P<appid>.{4})
+    .{53} # Misc other stuff
+    \x02appid\x00
+    .*?
+    \x01installdir\x00
+    (?P<installdir>[^\x00]*)\x00
+    .*?
+    \x00depots\x00
+  """, re.VERBOSE | re.DOTALL)
+
+  executable_regex = re.compile(rb"""
+    \x01executable\x00
+    (?P<executable>[^\x00]*)\x00
+    .*?
+    \x01oslist\x00
+    (?P<oslist>[^\x00]*)\x00
+  """, re.VERBOSE)
+  
+  for m in appid_regex.finditer(bytes):
+    appid = struct.unpack('I', m['appid'])[0]
+    app_data[appid] = {
+      'installdir': m['installdir'].decode('utf-8'),
+      'executable': {}, # windows, macos, linux
+    }
+    for m in executable_regex.finditer(bytes, m.start(), m.end()):
+      for os in m['oslist'].decode('utf-8').split(','):
+        app_data[appid]['executable'][os] = m['executable'].decode('utf-8')
+
 
 def open_url(url):
   if sys.platform == 'win32':
-    subprocess.run(['cmd', '/c', 'start', url])
+    subprocess.run(['cmd', '/c', 'start', url.replace('&', '^&')])
   elif sys.platform == 'darwin':
-    # Both ? and & have special meaning in bash.
     os.system('open ' + url.replace('?', '\\?').replace('&', '\\&'))
   else:
     os.system('xdg-open ' + url)
@@ -48,16 +83,18 @@ def show_chooser(options, key=None):
 
 
 def get_primary_executable(appid):
-
-  with (steam_folder / 'appcache' / 'appinfo.vdf').open('rb') as f:
-    # TODO: Look at https://github.com/SteamDatabase/SteamAppInfo
-    try:
-      return {
-        291550: steam_folder / 'steamapps' / 'common' / 'Brawlhalla' / 'Brawlhalla.app',
-      }[appid]
-    except KeyError:
-      print('Unknown executable path for appid: ' + appid)
-      return None
+  try:
+    app_info = app_data[int(appid)]
+  except KeyError:
+    return None
+  path = steam_folder / 'steamapps' / 'common' / app_info['installdir']
+  if sys.platform == 'win32':
+    path /= app_info['executable']['windows']
+  elif sys.platform == 'darwin':
+    path /= app_info['executable']['macos']
+  else:
+    path /= app_info['executable']['linux']
+  return path
 
 
 def get_steam_games():
@@ -77,11 +114,13 @@ def get_steam_games():
 
 
 # Search for an installed game which supports Remote Play Together
-def get_rpt_enabled_appid(steam_games):
+def get_rpt_enabled_game(steam_games):
   for game in steam_games:
     text = requests.get('https://store.steampowered.com/app/' + game['appid']).text
-    if 'https://store.steampowered.com/remoteplay_hub' in text:
-      return game['appid']
+    if 'ico_remote_play_together.png' in text:
+      route_target = get_primary_executable(game['appid'])
+      if route_target and route_target.exists():
+        return (route_target, game['appid'])
 
   # Else, no remote-play enabled apps are installed
   steam_f2p_rpt_games = 'https://store.steampowered.com/search/?maxprice=free&category2=44'
@@ -100,7 +139,6 @@ def get_rpt_enabled_appid(steam_games):
 
 def remote_play_anything():
   steam_games = get_steam_games()
-  appid = get_rpt_enabled_appid(steam_games)
 
   game_folders = [path for path in (steam_folder / 'steamapps' / 'common').iterdir() if path.is_dir()]
   game = show_chooser(game_folders, key=lambda p: p.stem)
@@ -123,11 +161,13 @@ def remote_play_anything():
   with restart_file.open('w+') as f:
     f.write(str(target))
 
-  # Replace the target game (which supports RPT) with ourselves 
-  route_target = get_primary_executable(appid)
-  target_path = str(route_target)
-  route_target.rename(route_target.parent / ('_' + route_target.name))
-  shutil.copy(sys.executable, target_path)
+  # Real executable (which supports RPT)
+  route_target, appid = get_rpt_enabled_game(steam_games)
+  # Rename it while we inject ourselves
+  renamed_target = route_target.parent / ('_' + route_target.name) 
+  renamed_target.unlink(missing_ok=True) # In case we failed to clean up, somehow
+  route_target.rename(renamed_target)
+  shutil.copy(sys.executable, route_target)
 
   # Then instruct steam to open the target game (which it will do with RPT enabled)
   # We will relaunch and run the function run_target_executable
@@ -142,33 +182,25 @@ def run_target_executable():
 
   # Rerun as target process
   # TODO: Remove extraneous args?
-  # subprocess.Popen([str(exe_path)], cwd=str(exe_path.parent), stdin=None, stderr=None, close_fds=None)
+  print(exe_path)
+  subprocess.Popen([str(exe_path)], cwd=str(exe_path.parent), stdin=None, stderr=None, close_fds=None)
 
   # Restore route target (involves deleting ourselves, so we need a bit of a hack)
   route_target = Path(sys.executable)
-  route_target = str(route_target.parent / ('_' + route_target.stem))
-  print(route_target)
-  input()
+  route_target = str(route_target.parent / ('_' + route_target.name))
+
   if sys.platform == 'win32':
     os.system(f'cmd /c ping 127.0.0.1 -n 4 >nul & del {sys.executable} & move {route_target} {sys.executable}') 
   elif sys.platform == 'darwin':
     os.system('sleep 3; rm {sys.executable}; mv {route_target} {sys.executable}')
   else:
     os.system('sleep 3; rm {sys.executable}; mv {route_target} {sys.executable}')
-    
-
-def check_for_recompile():
-  if Path(__file__).stat().st_mtime > Path(sys.executable).stat().st_mtime:
-    print('File has been modified more recently than executable, please recompile')
-    # sys.exit(0)
 
 
 if __name__ == '__main__':
-  # TODO: Maybe safer: Also check if calling process is named Steam.exe
   if restart_file.exists():
     run_target_executable()
   else:
-    check_for_recompile() # Only while in development
     get_steam_folder()
     remote_play_anything()
 
